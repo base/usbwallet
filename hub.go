@@ -17,7 +17,6 @@
 package usbwallet
 
 import (
-	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -26,7 +25,6 @@ import (
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/karalabe/hid"
 )
 
 // LedgerScheme is the protocol scheme prefixing account and wallet URLs.
@@ -45,15 +43,12 @@ const refreshThrottling = 500 * time.Millisecond
 
 // Hub is a accounts.Backend that can find and handle generic USB hardware wallets.
 type Hub struct {
-	scheme     string                  // Protocol scheme prefixing account and wallet URLs.
-	vendorID   uint16                  // USB vendor identifier used for device discovery
-	productIDs []uint16                // USB product identifiers used for device discovery
-	usageID    uint16                  // USB usage page identifier used for macOS device discovery
-	endpointID int                     // USB endpoint identifier used for non-macOS device discovery
+	scheme     string                  // Protocol scheme prefixing account and wallet URLs.\
+	enumerator enumerator              // Enumerator to use for discovering devices
 	makeDriver func(log.Logger) driver // Factory method to construct a vendor specific driver
 
 	refreshed   time.Time               // Time instance when the list of wallets was last refreshed
-	wallets     []accounts.Wallet       // List of USB wallet devices currently tracking
+	wallets     []Wallet                // List of USB wallet devices currently tracking
 	updateFeed  event.Feed              // Event feed to notify wallet additions/removals
 	updateScope event.SubscriptionScope // Subscription scope tracking current live listeners
 	updating    bool                    // Whether the event notification loop is running
@@ -70,7 +65,7 @@ type Hub struct {
 
 // NewLedgerHub creates a new hardware wallet manager for Ledger devices.
 func NewLedgerHub() (*Hub, error) {
-	return newHub(LedgerScheme, 0x2c97, []uint16{
+	enumerator := newHidEnumerator(0x2c97, []uint16{
 
 		// Device definitions taken from
 		// https://github.com/LedgerHQ/ledger-live/blob/595cb73b7e6622dbbcfc11867082ddc886f1bf01/libs/ledgerjs/packages/devices/src/index.ts
@@ -89,31 +84,28 @@ func NewLedgerHub() (*Hub, error) {
 		0x5000, /* WebUSB Ledger Nano S Plus */
 		0x6000, /* WebUSB Ledger Nano FTS */
 		0x7000, /* WebUSB Ledger Flex */
-	}, 0xffa0, 0, newLedgerDriver)
+	}, 0xffa0, 0)
+	return newHub(LedgerScheme, enumerator, newLedgerDriver)
 }
 
 // NewTrezorHubWithHID creates a new hardware wallet manager for Trezor devices.
 func NewTrezorHubWithHID() (*Hub, error) {
-	return newHub(TrezorScheme, 0x534c, []uint16{0x0001 /* Trezor HID */}, 0xff00, 0, newTrezorDriver)
+	enumerator := newHidEnumerator(0x534c, []uint16{0x0001 /* Trezor HID */}, 0xff00, 0)
+	return newHub(TrezorScheme, enumerator, newTrezorDriver)
 }
 
 // NewTrezorHubWithWebUSB creates a new hardware wallet manager for Trezor devices with
 // firmware version > 1.8.0
 func NewTrezorHubWithWebUSB() (*Hub, error) {
-	return newHub(TrezorScheme, 0x1209, []uint16{0x53c1 /* Trezor WebUSB */}, 0xffff /* No usage id on webusb, don't match unset (0) */, 0, newTrezorDriver)
+	enumerator := newUsbEnumerator(0x1209, []uint16{0x53c1 /* Trezor WebUSB */})
+	return newHub(TrezorScheme, enumerator, newTrezorDriver)
 }
 
 // newHub creates a new hardware wallet manager for generic USB devices.
-func newHub(scheme string, vendorID uint16, productIDs []uint16, usageID uint16, endpointID int, makeDriver func(log.Logger) driver) (*Hub, error) {
-	if !hid.Supported() {
-		return nil, errors.New("unsupported platform")
-	}
+func newHub(scheme string, enumerator enumerator, makeDriver func(log.Logger) driver) (*Hub, error) {
 	hub := &Hub{
 		scheme:     scheme,
-		vendorID:   vendorID,
-		productIDs: productIDs,
-		usageID:    usageID,
-		endpointID: endpointID,
+		enumerator: enumerator,
 		makeDriver: makeDriver,
 		quit:       make(chan chan error),
 	}
@@ -123,14 +115,14 @@ func newHub(scheme string, vendorID uint16, productIDs []uint16, usageID uint16,
 
 // Wallets implements accounts.Backend, returning all the currently tracked USB
 // devices that appear to be hardware wallets.
-func (hub *Hub) Wallets() []accounts.Wallet {
+func (hub *Hub) Wallets() []Wallet {
 	// Make sure the list of wallets is up to date
 	hub.refreshWallets()
 
 	hub.stateLock.RLock()
 	defer hub.stateLock.RUnlock()
 
-	cpy := make([]accounts.Wallet, len(hub.wallets))
+	cpy := make([]Wallet, len(hub.wallets))
 	copy(cpy, hub.wallets)
 	return cpy
 }
@@ -150,8 +142,6 @@ func (hub *Hub) refreshWallets() {
 	if hub.enumFails.Load() > 2 {
 		return
 	}
-	// Retrieve the current list of USB wallet devices
-	var devices []hid.DeviceInfo
 
 	if runtime.GOOS == "linux" {
 		// hidapi on Linux opens the device during enumeration to retrieve some infos,
@@ -166,7 +156,8 @@ func (hub *Hub) refreshWallets() {
 			return
 		}
 	}
-	infos, err := hid.Enumerate(hub.vendorID, 0)
+
+	infos, err := hub.enumerator.Infos()
 	if err != nil {
 		failcount := hub.enumFails.Add(1)
 		if runtime.GOOS == "linux" {
@@ -174,23 +165,11 @@ func (hub *Hub) refreshWallets() {
 			hub.commsLock.Unlock()
 		}
 		log.Error("Failed to enumerate USB devices", "hub", hub.scheme,
-			"vendor", hub.vendorID, "failcount", failcount, "err", err)
+			"failcount", failcount, "err", err)
 		return
 	}
 	hub.enumFails.Store(0)
 
-	for _, info := range infos {
-		for _, id := range hub.productIDs {
-			// We check both the raw ProductID (legacy) and just the upper byte, as Ledger
-			// uses `MMII`, encoding a model (MM) and an interface bitfield (II)
-			mmOnly := info.ProductID & 0xff00
-			// Windows and Macos use UsageID matching, Linux uses Interface matching
-			if (info.ProductID == id || mmOnly == id) && (info.UsagePage == hub.usageID || info.Interface == hub.endpointID) {
-				devices = append(devices, info)
-				break
-			}
-		}
-	}
 	if runtime.GOOS == "linux" {
 		// See rationale before the enumeration why this is needed and only on Linux.
 		hub.commsLock.Unlock()
@@ -199,12 +178,12 @@ func (hub *Hub) refreshWallets() {
 	hub.stateLock.Lock()
 
 	var (
-		wallets = make([]accounts.Wallet, 0, len(devices))
+		wallets = make([]Wallet, 0, len(infos))
 		events  []accounts.WalletEvent
 	)
 
-	for _, device := range devices {
-		url := accounts.URL{Scheme: hub.scheme, Path: device.Path}
+	for _, info := range infos {
+		url := accounts.URL{Scheme: hub.scheme, Path: info.Path()}
 
 		// Drop wallets in front of the next device or those that failed for some reason
 		for len(hub.wallets) > 0 {
@@ -220,7 +199,7 @@ func (hub *Hub) refreshWallets() {
 		// If there are no more wallets or the device is before the next, wrap new wallet
 		if len(hub.wallets) == 0 || hub.wallets[0].URL().Cmp(url) > 0 {
 			logger := log.New("url", url)
-			wallet := &wallet{hub: hub, driver: hub.makeDriver(logger), url: &url, info: device, log: logger}
+			wallet := &wallet{hub: hub, driver: hub.makeDriver(logger), url: &url, info: info, log: logger}
 
 			events = append(events, accounts.WalletEvent{Wallet: wallet, Kind: accounts.WalletArrived})
 			wallets = append(wallets, wallet)

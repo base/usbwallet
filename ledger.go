@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strconv"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
@@ -48,6 +49,9 @@ type ledgerParam1 byte
 // specific opcodes. The same parameter values may be reused between opcodes.
 type ledgerParam2 byte
 
+// ledgerStatus is an enumeration encoding ledger status words.
+type ledgerStatus uint16
+
 const (
 	ledgerOpRetrieveAddress  ledgerOpcode = 0x02 // Returns the public key and Ethereum address for a given BIP 32 path
 	ledgerOpSignTransaction  ledgerOpcode = 0x04 // Signs an Ethereum transaction after having the user validate the parameters
@@ -59,9 +63,33 @@ const (
 	ledgerP1InitTransactionData     ledgerParam1 = 0x00 // First transaction data block for signing
 	ledgerP1ContTransactionData     ledgerParam1 = 0x80 // Subsequent transaction data block for signing
 	ledgerP2DiscardAddressChainCode ledgerParam2 = 0x00 // Do not return the chain code along with the address
+	ledgerP2ProcessAndStartFlow     ledgerParam2 = 0x00 // Process and start transaction signing flow
+	ledgerP2V0Implementation        ledgerParam2 = 0x00 // EIP-712 V0 implementation (hashes only)
 
-	ledgerEip155Size int = 3 // Size of the EIP-155 chain_id,r,s in unsigned transactions
+	ledgerStatusNormalEnd ledgerStatus = 0x9000
+	ledgerEip155Size      int          = 3 // Size of the EIP-155 chain_id,r,s in unsigned transactions
 )
+
+var ledgerStatuses = map[ledgerStatus]string{
+	0x6001: "Mode check fail",
+	0x6501: "TransactionType not supported",
+	0x6502: "Output buffer too small for chainId conversion",
+	//0x68xx: "Internal error (Please report)",
+	0x6982: "Security status not satisfied (Canceled by user)",
+	0x6983: "Wrong Data length",
+	0x6984: "Plugin not installed",
+	0x6985: "Condition not satisfied",
+	0x6A00: "Error without info",
+	0x6A80: "Invalid data",
+	0x6A84: "Insufficient memory",
+	0x6A88: "Data not found",
+	0x6B00: "Incorrect parameter P1 or P2",
+	0x6D00: "Incorrect parameter INS",
+	0x6E00: "Incorrect parameter CLA",
+	0x6F00: "Incorrect parameter CLA",
+	0x6F01: "Technical problem (Internal error, please report)",
+	0x911C: "Command code not supported (i.e. Ledger-PKI not yet available)",
+}
 
 // errLedgerReplyInvalidHeader is the error message returned by a Ledger data exchange
 // if the device replies with a mismatching header. This usually means the device
@@ -71,6 +99,10 @@ var errLedgerReplyInvalidHeader = errors.New("ledger: invalid reply header")
 // errLedgerInvalidVersionReply is the error message returned by a Ledger version retrieval
 // when a response does arrive, but it does not contain the expected data.
 var errLedgerInvalidVersionReply = errors.New("ledger: invalid version reply")
+
+// errLedgerInvalidStatus is the error message returned if the ledger doesn't respond with a
+// 0x9000 status.
+var errLedgerInvalidStatus = errors.New("ledger: invalid status")
 
 // ledgerDriver implements the communication with a Ledger hardware wallet.
 type ledgerDriver struct {
@@ -119,7 +151,7 @@ func (w *ledgerDriver) Open(device io.ReadWriter, passphrase string) error {
 	_, err := w.ledgerDerive(accounts.DefaultBaseDerivationPath)
 	if err != nil {
 		// Ethereum app is not running or in browser mode, nothing more to do, return
-		if err == errLedgerReplyInvalidHeader {
+		if errors.Is(err, errLedgerReplyInvalidHeader) {
 			w.browser = true
 		}
 		return nil
@@ -141,7 +173,7 @@ func (w *ledgerDriver) Close() error {
 // Heartbeat implements usbwallet.driver, performing a sanity check against the
 // Ledger to see if it's still online.
 func (w *ledgerDriver) Heartbeat() error {
-	if _, err := w.ledgerVersion(); err != nil && err != errLedgerInvalidVersionReply {
+	if _, err := w.ledgerVersion(); err != nil && !errors.Is(err, errLedgerInvalidVersionReply) {
 		w.failure = err
 		return err
 	}
@@ -174,11 +206,11 @@ func (w *ledgerDriver) SignTx(path accounts.DerivationPath, tx *types.Transactio
 	return w.ledgerSign(path, tx, chainID)
 }
 
-// SignTypedMessage implements usbwallet.driver, sending the message to the Ledger and
+// SignTypedHash implements usbwallet.driver, sending the message to the Ledger and
 // waiting for the user to sign or deny the transaction.
 //
 // Note: this was introduced in the ledger 1.5.0 firmware
-func (w *ledgerDriver) SignTypedMessage(path accounts.DerivationPath, domainHash []byte, messageHash []byte) ([]byte, error) {
+func (w *ledgerDriver) SignTypedHash(path accounts.DerivationPath, domainHash []byte, messageHash []byte) ([]byte, error) {
 	// If the Ethereum app doesn't run, abort
 	if w.offline() {
 		return nil, accounts.ErrWalletClosed
@@ -189,7 +221,7 @@ func (w *ledgerDriver) SignTypedMessage(path accounts.DerivationPath, domainHash
 		return nil, fmt.Errorf("Ledger version >= 1.5.0 required for EIP-712 signing (found version v%d.%d.%d)", w.version[0], w.version[1], w.version[2])
 	}
 	// All infos gathered and metadata checks out, request signing
-	return w.ledgerSignTypedMessage(path, domainHash, messageHash)
+	return w.ledgerSignTypedHash(path, domainHash, messageHash)
 }
 
 // ledgerVersion retrieves the current version of the Ethereum wallet app running
@@ -360,7 +392,7 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 
 	// Send the request and wait for the response
 	var (
-		op    = ledgerP1InitTransactionData
+		p1    = ledgerP1InitTransactionData
 		reply []byte
 	)
 
@@ -378,13 +410,13 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 			chunk = len(payload)
 		}
 		// Send the chunk over, ensuring it's processed correctly
-		reply, err = w.ledgerExchange(ledgerOpSignTransaction, op, 0, payload[:chunk])
+		reply, err = w.ledgerExchange(ledgerOpSignTransaction, p1, ledgerP2ProcessAndStartFlow, payload[:chunk])
 		if err != nil {
 			return common.Address{}, nil, err
 		}
 		// Shift the payload and ensure subsequent chunks are marked as such
 		payload = payload[chunk:]
-		op = ledgerP1ContTransactionData
+		p1 = ledgerP1ContTransactionData
 	}
 	// Extract the Ethereum signature and do a sanity validation
 	if len(reply) != crypto.SignatureLength {
@@ -414,7 +446,7 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 	return sender, signed, nil
 }
 
-// ledgerSignTypedMessage sends the transaction to the Ledger wallet, and waits for the user
+// ledgerSignTypedHash sends the transaction to the Ledger wallet, and waits for the user
 // to confirm or deny the transaction.
 //
 // The signing protocol is defined as follows:
@@ -441,7 +473,7 @@ func (w *ledgerDriver) ledgerSign(derivationPath []uint32, tx *types.Transaction
 //	signature V | 1 byte
 //	signature R | 32 bytes
 //	signature S | 32 bytes
-func (w *ledgerDriver) ledgerSignTypedMessage(derivationPath []uint32, domainHash []byte, messageHash []byte) ([]byte, error) {
+func (w *ledgerDriver) ledgerSignTypedHash(derivationPath []uint32, domainHash []byte, messageHash []byte) ([]byte, error) {
 	// Flatten the derivation path into the Ledger request
 	path := make([]byte, 1+4*len(derivationPath))
 	path[0] = byte(len(derivationPath))
@@ -454,13 +486,12 @@ func (w *ledgerDriver) ledgerSignTypedMessage(derivationPath []uint32, domainHas
 
 	// Send the request and wait for the response
 	var (
-		op    = ledgerP1InitTypedMessageData
 		reply []byte
 		err   error
 	)
 
 	// Send the message over, ensuring it's processed correctly
-	reply, err = w.ledgerExchange(ledgerOpSignTypedMessage, op, 0, payload)
+	reply, err = w.ledgerExchange(ledgerOpSignTypedMessage, ledgerP1InitTypedMessageData, ledgerP2V0Implementation, payload)
 
 	if err != nil {
 		return nil, err
@@ -568,6 +599,17 @@ func (w *ledgerDriver) ledgerExchange(opcode ledgerOpcode, p1 ledgerParam1, p2 l
 			reply = append(reply, payload[:left]...)
 			break
 		}
+	}
+	if len(reply) < 2 {
+		return nil, errLedgerInvalidStatus
+	}
+	status := ledgerStatus(binary.BigEndian.Uint16(reply[len(reply)-2:]))
+	if status != ledgerStatusNormalEnd {
+		s := ledgerStatuses[status]
+		if s == "" {
+			s = "unknown error"
+		}
+		return nil, fmt.Errorf("%w: 0x%s (%s)", errLedgerInvalidStatus, strconv.FormatUint(uint64(status), 16), s)
 	}
 	return reply[:len(reply)-2], nil
 }
