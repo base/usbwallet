@@ -29,11 +29,12 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/accounts"
-	"github.com/ethereum/go-ethereum/accounts/usbwallet/trezor"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/mdehoog/usbwallet/trezor"
+	pin "github.com/reserve-protocol/trezor"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -52,13 +53,12 @@ var errTrezorReplyInvalidHeader = errors.New("trezor: invalid reply header")
 
 // trezorDriver implements the communication with a Trezor hardware wallet.
 type trezorDriver struct {
-	device         io.ReadWriter // USB device connection to communicate through
-	version        [3]uint32     // Current version of the Trezor firmware
-	label          string        // Current textual label of the Trezor device
-	pinwait        bool          // Flags whether the device is waiting for PIN entry
-	passphrasewait bool          // Flags whether the device is waiting for passphrase entry
-	failure        error         // Any failure that would make the device unusable
-	log            log.Logger    // Contextual logger to tag the trezor with its id
+	device     io.ReadWriter // USB device connection to communicate through
+	version    [3]uint32     // Current version of the Trezor firmware
+	label      string        // Current textual label of the Trezor device
+	passphrase string
+	failure    error      // Any failure that would make the device unusable
+	log        log.Logger // Contextual logger to tag the trezor with its id
 }
 
 // newTrezorDriver creates a new instance of a Trezor USB protocol driver.
@@ -77,87 +77,32 @@ func (w *trezorDriver) Status() (string, error) {
 	if w.device == nil {
 		return "Closed", w.failure
 	}
-	if w.pinwait {
-		return fmt.Sprintf("Trezor v%d.%d.%d '%s' waiting for PIN", w.version[0], w.version[1], w.version[2], w.label), w.failure
-	}
 	return fmt.Sprintf("Trezor v%d.%d.%d '%s' online", w.version[0], w.version[1], w.version[2], w.label), w.failure
 }
 
 // Open implements usbwallet.driver, attempting to initialize the connection to
-// the Trezor hardware wallet. Initializing the Trezor is a two or three phase operation:
-//   - The first phase is to initialize the connection and read the wallet's
-//     features. This phase is invoked if the provided passphrase is empty. The
-//     device will display the pinpad as a result and will return an appropriate
-//     error to notify the user that a second open phase is needed.
-//   - The second phase is to unlock access to the Trezor, which is done by the
-//     user actually providing a passphrase mapping a keyboard keypad to the pin
-//     number of the user (shuffled according to the pinpad displayed).
-//   - If needed the device will ask for passphrase which will require calling
-//     open again with the actual passphrase (3rd phase)
+// the Trezor hardware wallet.
 func (w *trezorDriver) Open(device io.ReadWriter, passphrase string) error {
-	w.device, w.failure = device, nil
+	w.device, w.passphrase, w.failure = device, passphrase, nil
 
-	// If phase 1 is requested, init the connection and wait for user callback
-	if passphrase == "" && !w.passphrasewait {
-		// If we're already waiting for a PIN entry, insta-return
-		if w.pinwait {
-			return ErrTrezorPINNeeded
-		}
-		// Initialize a connection to the device
-		features := new(trezor.Features)
-		if _, err := w.trezorExchange(&trezor.Initialize{}, features); err != nil {
-			return err
-		}
-		w.version = [3]uint32{features.GetMajorVersion(), features.GetMinorVersion(), features.GetPatchVersion()}
-		w.label = features.GetLabel()
-
-		// Do a manual ping, forcing the device to ask for its PIN and Passphrase
-		askPin := true
-		askPassphrase := true
-		res, err := w.trezorExchange(&trezor.Ping{PinProtection: &askPin, PassphraseProtection: &askPassphrase}, new(trezor.PinMatrixRequest), new(trezor.PassphraseRequest), new(trezor.Success))
-		if err != nil {
-			return err
-		}
-		// Only return the PIN request if the device wasn't unlocked until now
-		switch res {
-		case 0:
-			w.pinwait = true
-			return ErrTrezorPINNeeded
-		case 1:
-			w.pinwait = false
-			w.passphrasewait = true
-			return ErrTrezorPassphraseNeeded
-		case 2:
-			return nil // responded with trezor.Success
-		}
-	}
-	// Phase 2 requested with actual PIN entry
-	if w.pinwait {
-		w.pinwait = false
-		res, err := w.trezorExchange(&trezor.PinMatrixAck{Pin: &passphrase}, new(trezor.Success), new(trezor.PassphraseRequest))
-		if err != nil {
-			w.failure = err
-			return err
-		}
-		if res == 1 {
-			w.passphrasewait = true
-			return ErrTrezorPassphraseNeeded
-		}
-	} else if w.passphrasewait {
-		w.passphrasewait = false
-		if _, err := w.trezorExchange(&trezor.PassphraseAck{Passphrase: &passphrase}, new(trezor.Success)); err != nil {
-			w.failure = err
-			return err
-		}
+	if _, err := w.trezorExchange(&trezor.EndSession{}, new(trezor.Success)); err != nil {
+		return err
 	}
 
-	return nil
+	features := new(trezor.Features)
+	if _, err := w.trezorExchange(&trezor.Initialize{}, features); err != nil {
+		return err
+	}
+	w.version = [3]uint32{features.GetMajorVersion(), features.GetMinorVersion(), features.GetPatchVersion()}
+	w.label = features.GetLabel()
+
+	return w.Heartbeat()
 }
 
 // Close implements usbwallet.driver, cleaning up and metadata maintained within
 // the Trezor driver.
 func (w *trezorDriver) Close() error {
-	w.version, w.label, w.pinwait = [3]uint32{}, "", false
+	w.version, w.label = [3]uint32{}, ""
 	return nil
 }
 
@@ -186,8 +131,20 @@ func (w *trezorDriver) SignTx(path accounts.DerivationPath, tx *types.Transactio
 	return w.trezorSign(path, tx, chainID)
 }
 
-func (w *trezorDriver) SignTypedMessage(path accounts.DerivationPath, domainHash []byte, messageHash []byte) ([]byte, error) {
-	return nil, accounts.ErrNotSupported
+func (w *trezorDriver) SignTypedHash(path accounts.DerivationPath, domainHash []byte, messageHash []byte) ([]byte, error) {
+	if w.device == nil {
+		return nil, accounts.ErrWalletClosed
+	}
+	response := new(trezor.EthereumTypedDataSignature)
+	_, err := w.trezorExchange(&trezor.EthereumSignTypedHash{
+		AddressN:            path,
+		DomainSeparatorHash: domainHash,
+		MessageHash:         messageHash,
+	}, response)
+	if err != nil {
+		return nil, err
+	}
+	return response.Signature, nil
 }
 
 // trezorDerive sends a derivation request to the Trezor device and returns the
@@ -197,10 +154,7 @@ func (w *trezorDriver) trezorDerive(derivationPath []uint32) (common.Address, er
 	if _, err := w.trezorExchange(&trezor.EthereumGetAddress{AddressN: derivationPath}, address); err != nil {
 		return common.Address{}, err
 	}
-	if addr := address.GetAddressBin(); len(addr) > 0 { // Older firmwares use binary formats
-		return common.BytesToAddress(addr), nil
-	}
-	if addr := address.GetAddressHex(); len(addr) > 0 { // Newer firmwares use hexadecimal formats
+	if addr := address.GetAddress(); len(addr) > 0 {
 		return common.HexToAddress(addr), nil
 	}
 	return common.Address{}, errors.New("missing derived address")
@@ -224,8 +178,7 @@ func (w *trezorDriver) trezorSign(derivationPath []uint32, tx *types.Transaction
 	if to := tx.To(); to != nil {
 		// Non contract deploy, set recipient explicitly
 		hex := to.Hex()
-		request.ToHex = &hex     // Newer firmwares (old will ignore)
-		request.ToBin = (*to)[:] // Older firmwares (new will ignore)
+		request.To = &hex
 	}
 	if length > 1024 { // Send the data chunked if that was requested
 		request.DataInitialChunk, data = data[:1024], data[1024:]
@@ -233,7 +186,7 @@ func (w *trezorDriver) trezorSign(derivationPath []uint32, tx *types.Transaction
 		request.DataInitialChunk, data = data, nil
 	}
 	if chainID != nil { // EIP-155 transaction, set chain ID explicitly (only 32 bit is supported!?)
-		id := uint32(chainID.Int64())
+		id := chainID.Uint64()
 		request.ChainId = &id
 	}
 	// Send the initiation message and stream content until a signature is returned
@@ -250,11 +203,7 @@ func (w *trezorDriver) trezorSign(derivationPath []uint32, tx *types.Transaction
 		}
 	}
 	// Extract the Ethereum signature and do a sanity validation
-	if len(response.GetSignatureR()) == 0 || len(response.GetSignatureS()) == 0 {
-		return common.Address{}, nil, errors.New("reply lacks signature")
-	} else if response.GetSignatureV() == 0 && int(chainID.Int64()) <= (math.MaxUint32-36)/2 {
-		// for chainId >= (MaxUint32-36)/2, Trezor returns signature bit only
-		// https://github.com/trezor/trezor-mcu/pull/399
+	if len(response.GetSignatureR()) == 0 || len(response.GetSignatureS()) == 0 || response.GetSignatureV() == 0 {
 		return common.Address{}, nil, errors.New("reply lacks signature")
 	}
 	signature := append(append(response.GetSignatureR(), response.GetSignatureS()...), byte(response.GetSignatureV()))
@@ -366,6 +315,16 @@ func (w *trezorDriver) trezorExchange(req proto.Message, results ...proto.Messag
 	if kind == uint16(trezor.MessageType_MessageType_ButtonRequest) {
 		// Trezor is waiting for user confirmation, ack and wait for the next message
 		return w.trezorExchange(&trezor.ButtonAck{}, results...)
+	}
+	if kind == uint16(trezor.MessageType_MessageType_PinMatrixRequest) {
+		p, err := pin.GetPIN("Please enter your Trezor PIN")
+		if err != nil {
+			return 0, err
+		}
+		return w.trezorExchange(&trezor.PinMatrixAck{Pin: &p}, results...)
+	}
+	if kind == uint16(trezor.MessageType_MessageType_PassphraseRequest) {
+		return w.trezorExchange(&trezor.PassphraseAck{Passphrase: &w.passphrase}, results...)
 	}
 	for i, res := range results {
 		if trezor.Type(res) == kind {

@@ -31,7 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/karalabe/hid"
+	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 )
 
 // Maximum time between wallet health checks to detect USB unplugs.
@@ -40,6 +40,13 @@ const heartbeatCycle = time.Second
 // Minimum time to wait between self derivation attempts, even it the user is
 // requesting accounts like crazy.
 const selfDeriveThrottling = time.Second
+
+type Wallet interface {
+	accounts.Wallet
+
+	SignTypedData(account accounts.Account, data apitypes.TypedData) ([]byte, error)
+	SignTypedDataWithPassphrase(account accounts.Account, passphrase string, data apitypes.TypedData) ([]byte, error)
+}
 
 // driver defines the vendor specific functionality hardware wallets instances
 // must implement to allow using them with the wallet lifecycle management.
@@ -68,7 +75,17 @@ type driver interface {
 	// or deny the transaction.
 	SignTx(path accounts.DerivationPath, tx *types.Transaction, chainID *big.Int) (common.Address, *types.Transaction, error)
 
-	SignTypedMessage(path accounts.DerivationPath, messageHash []byte, domainHash []byte) ([]byte, error)
+	// SignText sends a message to sign to the USB device and waits for the user to confirm
+	// or deny the signature.
+	SignText(path accounts.DerivationPath, text []byte) ([]byte, error)
+
+	// SignTypedHash sends a typed message to sign to the USB device and waits for the user to confirm
+	// or deny the signature.
+	SignTypedHash(path accounts.DerivationPath, messageHash []byte, domainHash []byte) ([]byte, error)
+
+	// SignedTypedData sends a typed data struct to sign to the USB device and waits for the user to confirm
+	// or deny the signature.
+	SignedTypedData(path accounts.DerivationPath, data apitypes.TypedData) ([]byte, error)
 }
 
 // wallet represents the common functionality shared by all USB hardware
@@ -79,8 +96,8 @@ type wallet struct {
 	driver driver        // Hardware implementation of the low level device operations
 	url    *accounts.URL // Textual URL uniquely identifying this wallet
 
-	info   hid.DeviceInfo // Known USB device infos about the wallet
-	device hid.Device     // USB device advertising itself as a hardware wallet
+	info   info               // Known USB device infos about the wallet
+	device io.ReadWriteCloser // USB device advertising itself as a hardware wallet
 
 	accounts []accounts.Account                         // List of derive accounts pinned on the hardware wallet
 	paths    map[common.Address]accounts.DerivationPath // Known derivation paths for signing operations
@@ -536,39 +553,15 @@ func (w *wallet) SignData(account accounts.Account, mimeType string, data []byte
 	}
 
 	// dispatch to 712 signing if the mimetype is TypedData and the format matches
-	w.stateLock.RLock() // Comms have own mutex, this is for the state fields
-	defer w.stateLock.RUnlock()
 
-	// If the wallet is closed, abort
-	if w.device == nil {
-		return nil, accounts.ErrWalletClosed
-	}
-	// Make sure the requested account is contained within
-	path, ok := w.paths[account.Address]
-	if !ok {
-		return nil, accounts.ErrUnknownAccount
-	}
-	// All infos gathered and metadata checks out, request signing
-	<-w.commsLock
-	defer func() { w.commsLock <- struct{}{} }()
-
-	// Ensure the device isn't screwed with while user confirmation is pending
-	// TODO(karalabe): remove if hotplug lands on Windows
-	w.hub.commsLock.Lock()
-	w.hub.commsPend++
-	w.hub.commsLock.Unlock()
-
-	defer func() {
-		w.hub.commsLock.Lock()
-		w.hub.commsPend--
-		w.hub.commsLock.Unlock()
-	}()
-	// Sign the transaction
-	signature, err := w.driver.SignTypedMessage(path, data[2:34], data[34:66])
+	path, done, err := w.lockAndDerivePath(account)
 	if err != nil {
 		return nil, err
 	}
-	return signature, nil
+	defer done()
+
+	// Sign the transaction
+	return w.driver.SignTypedHash(path, data[2:34], data[34:66])
 }
 
 // SignDataWithPassphrase implements accounts.Wallet, attempting to sign the given
@@ -578,8 +571,37 @@ func (w *wallet) SignDataWithPassphrase(account accounts.Account, passphrase, mi
 	return w.SignData(account, mimeType, data)
 }
 
+// SignTypedData signs the EIP-712 typed data struct.
+func (w *wallet) SignTypedData(account accounts.Account, data apitypes.TypedData) ([]byte, error) {
+	path, done, err := w.lockAndDerivePath(account)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	return w.driver.SignedTypedData(path, data)
+}
+
+// SignTypedDataWithPassphrase implements accounts.Wallet, attempting to sign the given
+// typed data with the given account using passphrase as extra authentication.
+// Since USB wallets don't rely on passphrases, these are silently ignored.
+func (w *wallet) SignTypedDataWithPassphrase(account accounts.Account, passphrase string, data apitypes.TypedData) ([]byte, error) {
+	return w.SignTypedData(account, data)
+}
+
 func (w *wallet) SignText(account accounts.Account, text []byte) ([]byte, error) {
-	return w.signHash(account, accounts.TextHash(text))
+	path, done, err := w.lockAndDerivePath(account)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+
+	// Sign the transaction
+	signature, err := w.driver.SignText(path, text)
+	if err != nil {
+		return nil, err
+	}
+	return signature, nil
 }
 
 // SignTx implements accounts.Wallet. It sends the transaction over to the Ledger
@@ -590,33 +612,12 @@ func (w *wallet) SignText(account accounts.Account, text []byte) ([]byte, error)
 // too old to sign EIP-155 transactions, but such is requested nonetheless, an error
 // will be returned opposed to silently signing in Homestead mode.
 func (w *wallet) SignTx(account accounts.Account, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
-	w.stateLock.RLock() // Comms have own mutex, this is for the state fields
-	defer w.stateLock.RUnlock()
-
-	// If the wallet is closed, abort
-	if w.device == nil {
-		return nil, accounts.ErrWalletClosed
+	path, done, err := w.lockAndDerivePath(account)
+	if err != nil {
+		return nil, err
 	}
-	// Make sure the requested account is contained within
-	path, ok := w.paths[account.Address]
-	if !ok {
-		return nil, accounts.ErrUnknownAccount
-	}
-	// All infos gathered and metadata checks out, request signing
-	<-w.commsLock
-	defer func() { w.commsLock <- struct{}{} }()
+	defer done()
 
-	// Ensure the device isn't screwed with while user confirmation is pending
-	// TODO(karalabe): remove if hotplug lands on Windows
-	w.hub.commsLock.Lock()
-	w.hub.commsPend++
-	w.hub.commsLock.Unlock()
-
-	defer func() {
-		w.hub.commsLock.Lock()
-		w.hub.commsPend--
-		w.hub.commsLock.Unlock()
-	}()
 	// Sign the transaction and verify the sender to avoid hardware fault surprises
 	sender, signed, err := w.driver.SignTx(path, tx, chainID)
 	if err != nil {
@@ -632,7 +633,7 @@ func (w *wallet) SignTx(account accounts.Account, tx *types.Transaction, chainID
 // data is not supported for Ledger wallets, so this method will always return
 // an error.
 func (w *wallet) SignTextWithPassphrase(account accounts.Account, passphrase string, text []byte) ([]byte, error) {
-	return w.SignText(account, accounts.TextHash(text))
+	return w.SignText(account, text)
 }
 
 // SignTxWithPassphrase implements accounts.Wallet, attempting to sign the given
@@ -640,4 +641,39 @@ func (w *wallet) SignTextWithPassphrase(account accounts.Account, passphrase str
 // Since USB wallets don't rely on passphrases, these are silently ignored.
 func (w *wallet) SignTxWithPassphrase(account accounts.Account, passphrase string, tx *types.Transaction, chainID *big.Int) (*types.Transaction, error) {
 	return w.SignTx(account, tx, chainID)
+}
+
+func (w *wallet) lockAndDerivePath(account accounts.Account) (accounts.DerivationPath, func(), error) {
+	w.stateLock.RLock() // Comms have own mutex, this is for the state fields
+
+	// If the wallet is closed, abort
+	if w.device == nil {
+		w.stateLock.RUnlock()
+		return nil, nil, accounts.ErrWalletClosed
+	}
+	// Make sure the requested account is contained within
+	path, ok := w.paths[account.Address]
+	if !ok {
+		w.stateLock.RUnlock()
+		return nil, nil, accounts.ErrUnknownAccount
+	}
+	// All infos gathered and metadata checks out, request signing
+	<-w.commsLock
+
+	// Ensure the device isn't screwed with while user confirmation is pending
+	// TODO(karalabe): remove if hotplug lands on Windows
+	w.hub.commsLock.Lock()
+	w.hub.commsPend++
+	w.hub.commsLock.Unlock()
+
+	done := func() {
+		w.stateLock.RUnlock()
+		w.commsLock <- struct{}{}
+
+		w.hub.commsLock.Lock()
+		w.hub.commsPend--
+		w.hub.commsLock.Unlock()
+	}
+
+	return path, done, nil
 }
