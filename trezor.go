@@ -28,28 +28,30 @@ import (
 	"math"
 	"math/big"
 
+	"github.com/base/usbwallet/trezor"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/base/usbwallet/trezor"
 	pin "github.com/reserve-protocol/trezor"
 	"google.golang.org/protobuf/proto"
 )
-
-// ErrTrezorPINNeeded is returned if opening the trezor requires a PIN code. In
-// this case, the calling application should display a pinpad and send back the
-// encoded passphrase.
-var ErrTrezorPINNeeded = errors.New("trezor: pin needed")
-
-// ErrTrezorPassphraseNeeded is returned if opening the trezor requires a passphrase
-var ErrTrezorPassphraseNeeded = errors.New("trezor: passphrase needed")
 
 // errTrezorReplyInvalidHeader is the error message returned by a Trezor data exchange
 // if the device replies with a mismatching header. This usually means the device
 // is in browser mode.
 var errTrezorReplyInvalidHeader = errors.New("trezor: invalid reply header")
+
+type TrezorFailure struct {
+	*trezor.Failure
+}
+
+// Error implements the error interface for the TrezorFailure type, returning
+// a formatted error message containing the failure reason.
+func (f *TrezorFailure) Error() string {
+	return fmt.Sprintf("trezor: %s", f.GetMessage())
+}
 
 // trezorDriver implements the communication with a Trezor hardware wallet.
 type trezorDriver struct {
@@ -310,7 +312,7 @@ func (w *trezorDriver) trezorExchange(req proto.Message, results ...proto.Messag
 		if err := proto.Unmarshal(reply, failure); err != nil {
 			return 0, err
 		}
-		return 0, errors.New("trezor: " + failure.GetMessage())
+		return 0, &TrezorFailure{Failure: failure}
 	}
 	if kind == uint16(trezor.MessageType_MessageType_ButtonRequest) {
 		// Trezor is waiting for user confirmation, ack and wait for the next message
