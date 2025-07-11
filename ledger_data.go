@@ -19,7 +19,8 @@ const (
 	ledgerOpEip712SendStructDef  ledgerOpcode = 0x1a // Sends EIP-712 struct types to the ledger
 	ledgerOpEip712SendStructImpl ledgerOpcode = 0x1c // Sends EIP-712 struct values to the ledger
 
-	ledgerP1CompleteSend       ledgerParam1 = 0x00 // Send the full value in a single message
+	ledgerP1CompleteSend       ledgerParam1 = 0x00 // Complete the value (in one go, or after partial)
+	ledgerP1PartialSend        ledgerParam1 = 0x01 // Send partial data
 	ledgerP2StructName         ledgerParam2 = 0x00 // Send EIP-712 struct name
 	ledgerP2RootStruct         ledgerParam2 = 0x00 // Send EIP-712 root struct
 	ledgerP2Array              ledgerParam2 = 0x0f // Send EIP-712 array
@@ -267,10 +268,19 @@ func (w *ledgerDriver) ledgerSignTypedData(derivationPath []uint32, data apitype
 			return fmt.Errorf("unsupported type for field %s: %T", name, value)
 		}
 
+		chunk := 255
 		payload := binary.BigEndian.AppendUint16([]byte{}, uint16(len(enc)))
 		payload = append(payload, enc...)
-		if _, err = w.ledgerExchange(ledgerOpEip712SendStructImpl, ledgerP1CompleteSend, ledgerP2StructField, payload); err != nil {
-			return fmt.Errorf("failed to send domain field %s: %w", name, err)
+		for len(payload) > 0 {
+			p1 := ledgerP1PartialSend
+			if chunk >= len(payload) {
+				chunk = len(payload)
+				p1 = ledgerP1CompleteSend
+			}
+			if _, err := w.ledgerExchange(ledgerOpEip712SendStructImpl, p1, ledgerP2StructField, payload[:chunk]); err != nil {
+				return fmt.Errorf("failed to send field %s: %w", name, err)
+			}
+			payload = payload[chunk:]
 		}
 		return nil
 	}
