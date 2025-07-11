@@ -2,14 +2,15 @@ package usbwallet
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"reflect"
 
+	"github.com/base/usbwallet/trezor"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
-	"github.com/base/usbwallet/trezor"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -50,11 +51,18 @@ func (w *trezorDriver) SignedTypedData(path accounts.DerivationPath, data apityp
 		AddressN:    path,
 		PrimaryType: &data.PrimaryType,
 	}
+	nestedArray := false
 	for {
 		n, err := w.trezorExchange(req, signature, structRequest, valueRequest)
 		if err != nil {
+			var trezorFailure *TrezorFailure
+			if nestedArray && errors.As(err, &trezorFailure) &&
+				trezorFailure.Code != nil && *trezorFailure.Code == trezor.Failure_Failure_FirmwareError {
+				return nil, fmt.Errorf("trezor: nested arrays are not supported by this firmware version: %w", err)
+			}
 			return nil, err
 		}
+		nestedArray = false
 		switch n {
 		case 0:
 			// No additional data needed, return the signature
@@ -140,17 +148,20 @@ func (w *trezorDriver) SignedTypedData(path accounts.DerivationPath, data apityp
 				if err != nil {
 					return nil, err
 				}
-				for j := 0; j < len(arrays) && i < len(valueRequest.MemberPath); i, j = i+1, j+1 {
-					p = valueRequest.MemberPath[i]
+				if len(arrays) > 1 {
+					nestedArray = true
+				}
+				for j := 0; j < len(arrays) && i < len(valueRequest.MemberPath)-1; i, j = i+1, j+1 {
 					k := reflect.TypeOf(nextValue).Kind()
 					if !(k == reflect.Array || k == reflect.Slice) {
 						return nil, fmt.Errorf("trezor: expected array at path %v, got %T", valueRequest.MemberPath[:i+1], nextValue)
 					}
 					a := reflect.ValueOf(nextValue)
+					p = valueRequest.MemberPath[i+1]
 					if int(p) >= a.Len() {
 						return nil, fmt.Errorf("trezor: invalid array index %d for path %v", p, valueRequest.MemberPath[:i+1])
 					}
-					nextValue = a.Index(j)
+					nextValue = a.Index(int(p)).Interface()
 				}
 				k := reflect.TypeOf(nextValue).Kind()
 				if i < len(valueRequest.MemberPath)-1 {
