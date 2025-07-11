@@ -71,9 +71,11 @@ const (
 )
 
 var ledgerStatuses = map[ledgerStatus]string{
+	0x5515: "Device is locked",
 	0x6001: "Mode check fail",
 	0x6501: "TransactionType not supported",
 	0x6502: "Output buffer too small for chainId conversion",
+	0x6511: "Ethereum app not open",
 	//0x68xx: "Internal error (Please report)",
 	0x6982: "Security status not satisfied (Canceled by user)",
 	0x6983: "Wrong Data length",
@@ -539,6 +541,16 @@ func (w *ledgerDriver) ledgerSignTypedHash(derivationPath []uint32, domainHash [
 //	APDU length              | 1 byte
 //	Optional APDU data       | arbitrary
 func (w *ledgerDriver) ledgerExchange(opcode ledgerOpcode, p1 ledgerParam1, p2 ledgerParam2, data []byte) ([]byte, error) {
+	for i := 1; ; i++ {
+		res, err := w._ledgerExchange(opcode, p1, p2, data)
+		// on failure, try the exchange 3 times in total
+		if err == nil || i == 3 {
+			return res, err
+		}
+	}
+}
+
+func (w *ledgerDriver) _ledgerExchange(opcode ledgerOpcode, p1 ledgerParam1, p2 ledgerParam2, data []byte) ([]byte, error) {
 	// Construct the message payload, possibly split into multiple chunks
 	apdu := make([]byte, 2, 7+len(data))
 
