@@ -33,7 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/mdehoog/usbwallet/trezor"
+	"github.com/base/usbwallet/trezor"
 	pin "github.com/reserve-protocol/trezor"
 	"google.golang.org/protobuf/proto"
 )

@@ -18,7 +18,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
-	"github.com/mdehoog/usbwallet"
+	"github.com/base/usbwallet"
 )
 
 func main() {

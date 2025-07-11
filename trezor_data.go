@@ -9,7 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
-	"github.com/mdehoog/usbwallet/trezor"
+	"github.com/base/usbwallet/trezor"
 	"google.golang.org/protobuf/proto"
 )
 

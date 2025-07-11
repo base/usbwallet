@@ -1,4 +1,4 @@
-module github.com/mdehoog/usbwallet
+module github.com/base/usbwallet
 
 go 1.23.0
 
