@@ -44,6 +44,11 @@ func (w *trezorDriver) SignedTypedData(path accounts.DerivationPath, data apityp
 		return w.SignTypedHash(path, []byte(domainHash), []byte(messageHash))
 	}
 
+	if w.version[0] == 2 && (w.version[1] < 9 || (w.version[1] == 9 && w.version[2] == 0)) {
+		// ShowMessageHash was introduced in Trezor firmware v2.9.1
+		return nil, fmt.Errorf("trezor: typed data signing requires firmware v2.9.1 or newer")
+	}
+
 	signature := new(trezor.EthereumTypedDataSignature)
 	structRequest := new(trezor.EthereumTypedDataStructRequest)
 	valueRequest := new(trezor.EthereumTypedDataValueRequest)
