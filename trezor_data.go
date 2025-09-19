@@ -34,22 +34,28 @@ func (w *trezorDriver) SignedTypedData(path accounts.DerivationPath, data apityp
 		return nil, accounts.ErrWalletClosed
 	}
 
+	_, hashes, err := apitypes.TypedDataAndHash(data)
+	if err != nil {
+		return nil, fmt.Errorf("trezor: error hashing typed data: %w", err)
+	}
+	domainHash, messageHash := hashes[2:34], hashes[34:66]
 	if w.version[0] == 1 {
 		// legacy Trezor devices don't support typed data; fallback to hash signing:
-		_, hashes, err := apitypes.TypedDataAndHash(data)
-		if err != nil {
-			return nil, fmt.Errorf("trezor: error hashing typed data: %w", err)
-		}
-		domainHash, messageHash := hashes[2:34], hashes[34:66]
 		return w.SignTypedHash(path, []byte(domainHash), []byte(messageHash))
+	}
+
+	if w.version[0] == 2 && (w.version[1] < 9 || (w.version[1] == 9 && w.version[2] == 0)) {
+		// ShowMessageHash was introduced in Trezor firmware v2.9.1
+		return nil, fmt.Errorf("trezor: typed data signing requires firmware v2.9.1 or newer")
 	}
 
 	signature := new(trezor.EthereumTypedDataSignature)
 	structRequest := new(trezor.EthereumTypedDataStructRequest)
 	valueRequest := new(trezor.EthereumTypedDataValueRequest)
 	var req proto.Message = &trezor.EthereumSignTypedData{
-		AddressN:    path,
-		PrimaryType: &data.PrimaryType,
+		AddressN:        path,
+		PrimaryType:     &data.PrimaryType,
+		ShowMessageHash: []byte(messageHash),
 	}
 	nestedArray := false
 	for {
