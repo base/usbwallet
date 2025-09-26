@@ -6,8 +6,7 @@ toolchain go1.24.3
 
 require (
 	github.com/ethereum/go-ethereum v1.16.1
-	github.com/google/gousb v1.1.3
-	github.com/karalabe/hid v1.0.1-0.20240306101548-573246063e52
+	github.com/karalabe/usb v0.0.3-0.20231219215548-8627268f6b0a
 	github.com/reserve-protocol/trezor v0.0.0-20190523030725-9e38328dde28
 	google.golang.org/protobuf v1.36.6
 )

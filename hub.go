@@ -65,7 +65,7 @@ type Hub struct {
 
 // NewLedgerHub creates a new hardware wallet manager for Ledger devices.
 func NewLedgerHub() (*Hub, error) {
-	enumerator := newHidEnumerator(0x2c97, []uint16{
+	enumerator := newUsbEnumerator(0x2c97, []uint16{
 
 		// Device definitions taken from
 		// https://github.com/LedgerHQ/ledger-live/blob/595cb73b7e6622dbbcfc11867082ddc886f1bf01/libs/ledgerjs/packages/devices/src/index.ts
@@ -90,14 +90,14 @@ func NewLedgerHub() (*Hub, error) {
 
 // NewTrezorHubWithHID creates a new hardware wallet manager for Trezor devices.
 func NewTrezorHubWithHID() (*Hub, error) {
-	enumerator := newHidEnumerator(0x534c, []uint16{0x0001 /* Trezor HID */}, 0xff00, 0)
+	enumerator := newUsbEnumerator(0x534c, []uint16{0x0001 /* Trezor HID */}, 0xff00, 0)
 	return newHub(TrezorScheme, enumerator, newTrezorDriver)
 }
 
 // NewTrezorHubWithWebUSB creates a new hardware wallet manager for Trezor devices with
 // firmware version > 1.8.0
 func NewTrezorHubWithWebUSB() (*Hub, error) {
-	enumerator := newUsbEnumerator(0x1209, []uint16{0x53c1 /* Trezor WebUSB */})
+	enumerator := newUsbEnumerator(0x1209, []uint16{0x53c1 /* Trezor WebUSB */}, 0xffff /* No usage id on webusb, don't match unset (0) */, 0)
 	return newHub(TrezorScheme, enumerator, newTrezorDriver)
 }
 
