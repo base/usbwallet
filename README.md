@@ -1,5 +1,7 @@
 # usbwallet
 
+![Go](https://github.com/AdekunleBamz/usbwallet/actions/workflows/ci.yml/badge.svg)
+
 Fork of go-ethereum's [usbwallet package](https://github.com/ethereum/go-ethereum/tree/master/accounts/usbwallet)
 with support for:
  - non-HID devices (recent Trezor firmware)
