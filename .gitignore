@@ -1,1 +1,16 @@
-/.idea/
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# VS Code and Editor
+.vscode/
+.idea/
