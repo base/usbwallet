@@ -10,6 +10,7 @@ import (
 	"github.com/base/usbwallet/trezor"
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"google.golang.org/protobuf/proto"
 )
@@ -184,12 +185,17 @@ func (w *trezorDriver) SignedTypedData(path accounts.DerivationPath, data apityp
 					switch dt {
 					case CustomType:
 						return nil, fmt.Errorf("trezor: cannot encode custom type %s at path %v", name, valueRequest.MemberPath[:i+1])
-					case IntType, UintType, AddressType, FixedBytesType:
-						if str, ok := nextValue.(string); ok {
-							value = common.FromHex(str)
-						} else if f, ok := nextValue.(float64); ok {
-							value = new(big.Int).SetInt64(int64(f)).Bytes()
+					case IntType, UintType:
+						value, err = encodeInteger(nextValue, dt == IntType, byteLength)
+						if err != nil {
+							return nil, fmt.Errorf("trezor: value at path %v: %w", valueRequest.MemberPath[:i+1], err)
 						}
+					case AddressType, FixedBytesType:
+						str, ok := nextValue.(string)
+						if !ok {
+							return nil, fmt.Errorf("trezor: expected hex string at path %v, got %T", valueRequest.MemberPath[:i+1], nextValue)
+						}
+						value = common.FromHex(str)
 						if len(value) > byteLength {
 							return nil, fmt.Errorf("trezor: value at path %v is too long (%d bytes, expected %d)", valueRequest.MemberPath[:i+1], len(value), byteLength)
 						}
@@ -228,4 +234,47 @@ func (w *trezorDriver) SignedTypedData(path accounts.DerivationPath, data apityp
 			return nil, fmt.Errorf("trezor: unexpected reply index %d", n)
 		}
 	}
+}
+
+// encodeInteger encodes an EIP-712 int/uint value as the big-endian bytes the Trezor expects
+// (two's complement for negative ints), padded to byteLength. It accepts the same value types
+// go-ethereum's apitypes uses when hashing, so the device receives exactly the values that were
+// hashed: *math.HexOrDecimal256 (TypedDataDomain.Map() returns chainId as this), *big.Int,
+// decimal or 0x-hex strings, and lossless float64 (JSON numbers). Other types are an error
+// rather than an empty value, which would reach the device as 0.
+func encodeInteger(v interface{}, signed bool, byteLength int) ([]byte, error) {
+	var b *big.Int
+	switch x := v.(type) {
+	case *math.HexOrDecimal256:
+		b = (*big.Int)(x)
+	case *big.Int:
+		b = x
+	case string:
+		var h math.HexOrDecimal256
+		if err := h.UnmarshalText([]byte(x)); err != nil {
+			return nil, fmt.Errorf("invalid integer %q: %w", x, err)
+		}
+		b = (*big.Int)(&h)
+	case float64:
+		if float64(int64(x)) != x {
+			return nil, fmt.Errorf("invalid integer %v: not representable without loss", x)
+		}
+		b = big.NewInt(int64(x))
+	}
+	if b == nil {
+		return nil, fmt.Errorf("unsupported integer value %v of type %T", v, v)
+	}
+	bits := uint(byteLength * 8)
+	if signed {
+		limit := new(big.Int).Lsh(big.NewInt(1), bits-1)
+		if b.Cmp(limit) >= 0 || b.Cmp(new(big.Int).Neg(limit)) < 0 {
+			return nil, fmt.Errorf("integer %s does not fit in int%d", b, bits)
+		}
+		if b.Sign() < 0 {
+			b = new(big.Int).Add(b, new(big.Int).Lsh(big.NewInt(1), bits))
+		}
+	} else if b.Sign() < 0 || b.BitLen() > int(bits) {
+		return nil, fmt.Errorf("integer %s does not fit in uint%d", b, bits)
+	}
+	return b.FillBytes(make([]byte, byteLength)), nil
 }
